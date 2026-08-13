@@ -83,6 +83,7 @@
       border-radius: 6px;
       padding: 8px;
       height: 300px;
+      width: 100%;
     }
     .chart-title {
       font-size: 12px;
@@ -182,20 +183,17 @@
       const panel = document.getElementById(`tx-panel-${token}`);
       if (!panel) return;
 
-      const txType = txData.type === 'mint' ? '创建' : 
-                     txData.type === 'burn' ? '销毁' : 
-                     txData.from === '0x0000000000000000000000000000000000000000' ? '铸造' : '转账';
-      
       const isBuy = txData.from === '0x0000000000000000000000000000000000000000';
       const txClass = isBuy ? 'tx-buy' : 'tx-sell';
       
       const txItem = document.createElement('div');
       txItem.className = `transaction-item ${txClass}`;
+      const amount = (parseInt(txData.amount) / 1e18).toFixed(6);
       txItem.innerHTML = `
         <span class="font-mono text-xs">${new Date(txData.timestamp).toLocaleTimeString()}</span> 
         ${isBuy ? '✅ 买' : '❌ 卖'} 
         ${txData.to.slice(0, 6)}...
-        <span class="text-gray-500">${(parseInt(txData.amount) / 1e18).toFixed(6)}</span>
+        <span class="text-gray-500">${amount}</span>
       `;
       
       panel.insertBefore(txItem, panel.firstChild);
@@ -230,7 +228,7 @@
       updateKLineData(token);
     }
 
-    // 聚合 5 秒 K 线
+    // 聚合 5 秒 K 线 - 修复版本，使用真实的价格数据
     function updateKLineData(token) {
       const tokenData = tokenDataMap.get(token);
       if (!tokenData || tokenData.transactions.length === 0) return;
@@ -243,13 +241,8 @@
         if (!klineMap.has(timeKey)) {
           klineMap.set(timeKey, {
             time: Math.floor(timeKey / 1000),
-            open: 0,
-            high: 0,
-            low: Infinity,
-            close: 0,
+            prices: [],
             volume: 0,
-            buyVolume: 0,
-            sellVolume: 0,
             count: 0
           });
         }
@@ -257,29 +250,32 @@
         const kline = klineMap.get(timeKey);
         const amount = parseInt(tx.amount) / 1e18;
         
-        kline.open = kline.count === 0 ? amount : kline.open;
-        kline.high = Math.max(kline.high, amount);
-        kline.low = Math.min(kline.low, amount);
-        kline.close = amount;
+        kline.prices.push(amount);
         kline.volume += amount;
         kline.count++;
-
-        if (tx.from === '0x0000000000000000000000000000000000000000') {
-          kline.buyVolume += amount;
-        } else if (tx.to === '0x0000000000000000000000000000000000000000') {
-          kline.sellVolume += amount;
-        }
       });
 
+      // 将聚合的数据转换为 K 线格式
       tokenData.klineData = Array.from(klineMap.values())
         .sort((a, b) => a.time - b.time)
-        .map(kline => ({
-          time: kline.time,
-          open: Math.random() * 0.001 + 0.0001,
-          high: Math.random() * 0.001 + 0.0001,
-          low: Math.random() * 0.0001,
-          close: Math.random() * 0.001 + 0.00005
-        }));
+        .map(kline => {
+          if (kline.prices.length === 0) return null;
+          
+          const prices = kline.prices;
+          const open = prices[0];
+          const close = prices[prices.length - 1];
+          const high = Math.max(...prices);
+          const low = Math.min(...prices);
+          
+          return {
+            time: kline.time,
+            open: open,
+            high: high,
+            low: low,
+            close: close
+          };
+        })
+        .filter(kline => kline !== null);
 
       // 更新图表
       const chart = document.getElementById(`chart-${token}`);
@@ -294,7 +290,7 @@
       if (!tokenData || !tokenData.chart) return;
 
       try {
-        if (tokenData.candleSeries) {
+        if (tokenData.candleSeries && tokenData.klineData.length > 0) {
           tokenData.candleSeries.setData(tokenData.klineData);
           tokenData.chart.timeScale().fitContent();
         }
@@ -309,6 +305,7 @@
       if (!chartContainer) return;
 
       try {
+        const width = chartContainer.parentElement.offsetWidth - 20;
         const chart = LightweightCharts.createChart(chartContainer, {
           layout: {
             textColor: '#9ca3af',
@@ -318,7 +315,7 @@
             timeVisible: true,
             secondsVisible: true,
           },
-          width: chartContainer.parentElement.offsetWidth - 20,
+          width: width,
           height: 280
         });
 
@@ -331,13 +328,18 @@
           wickDownColor: '#ef4444'
         });
 
-        tokenData.chart = chart;
-        tokenData.candleSeries = candleSeries;
+        const tokenData = tokenDataMap.get(token);
+        if (tokenData) {
+          tokenData.chart = chart;
+          tokenData.candleSeries = candleSeries;
+        }
+        
         chartContainer.lwchart = true;
 
         // 初始数据
-        if (tokenData.klineData.length > 0) {
-          candleSeries.setData(tokenData.klineData);
+        const tokenData2 = tokenDataMap.get(token);
+        if (tokenData2 && tokenData2.klineData.length > 0) {
+          candleSeries.setData(tokenData2.klineData);
           chart.timeScale().fitContent();
         }
       } catch (err) {
