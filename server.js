@@ -176,13 +176,12 @@ async function startTokenMonitoring(tokenAddress, creator, tokenData) {
       const isMint = fromLower === '0x0000000000000000000000000000000000000000';
       const isBurn = toLower === '0x0000000000000000000000000000000000000000';
       
-      // 尝试从交易日志中提取价格信息（这是一个简化版本）
-      // 实际需要解析交易内容来获取 BNB 输入量
+      // 创建交易数据
       const txData = {
         token: tokenAddress,
         from: fromLower,
         to: toLower,
-        amount: amount.toString(),
+        amount: amount.toString(), // 保持为 BigInt 字符串格式
         amountFormatted: amountFormatted,
         transactionHash: event.log.transactionHash,
         blockNumber: event.log.blockNumber,
@@ -192,6 +191,8 @@ async function startTokenMonitoring(tokenAddress, creator, tokenData) {
         isSell: isBurn, // 销毁 = 卖出
         isCreatorBuy: toLower === creator && isMint
       };
+      
+      console.log(`📝 [交易事件] ${tokenAddress.slice(0, 10)}... | 类型: ${txData.type} | 金额: ${amountFormatted}`);
       
       // 更新市值指标
       updateTokenMetrics(tokenAddress, txData, decimals);
@@ -224,14 +225,27 @@ async function startTokenMonitoring(tokenAddress, creator, tokenData) {
       
       // 推送交易数据和市值信息给前端
       const metrics = tokenMetrics.get(tokenAddress) || {};
-      io.emit('tokenTransaction', {
-        ...txData,
+      const emitData = {
+        token: tokenAddress,
+        from: fromLower,
+        to: toLower,
+        amount: amount.toString(),
+        amountFormatted: amountFormatted,
+        transactionHash: event.log.transactionHash,
+        blockNumber: event.log.blockNumber,
+        timestamp: Date.now(),
+        type: txData.type,
+        isBuy: isMint,
+        isSell: isBurn,
         metrics: {
           marketCapUSD: metrics.marketCapUSD,
           currentPrice: metrics.currentPrice,
           totalBNBInvested: metrics.totalBNBInvested
         }
-      });
+      };
+      
+      io.emit('tokenTransaction', emitData);
+      console.log(`📤 [推送交易] token: ${tokenAddress.slice(0, 10)}...`);
     });
     
     monitoredTokens.set(tokenAddress, contract);
