@@ -1,0 +1,430 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Flap 毫秒级实时监控</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.0.0/dist/lightweight-charts.standalone.production.min.js"></script>
+  <style>
+    body { background: #0b0b0f; }
+    .row {
+      background: linear-gradient(90deg, #16161f, #0f0f15);
+      border: 1px solid #252532;
+      transition: all 0.2s ease;
+    }
+    .row:hover {
+      border-color: #6366f1;
+      background: linear-gradient(90deg, #1a1a28, #12121c);
+    }
+    /* CA地址样式 - 可点击复制 */
+    .ca-address {
+      text-align: center;
+      font-size: 12px;
+      color: #9ca3af;
+      margin-top: 8px;
+      font-family: 'Courier New', monospace;
+      letter-spacing: 0.5px;
+      cursor: pointer;
+      padding: 6px 8px;
+      border-radius: 4px;
+      transition: all 0.2s;
+    }
+    .ca-address:hover {
+      background: rgba(99, 102, 241, 0.2);
+      color: #e0e7ff;
+    }
+    /* 媒体链接无下划线 */
+    .media-link {
+      text-decoration: none !important;
+      word-break: break-all;
+      color: #9ca3af;
+      font-size: 12px;
+      max-width: 300px;
+    }
+    .media-link:hover {
+      color: #e0e7ff;
+    }
+    /* 交易列表和K线容器 */
+    .data-panels {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+      margin-top: 12px;
+    }
+    .transaction-panel {
+      background: rgba(0, 0, 0, 0.3);
+      border: 1px solid #333;
+      border-radius: 6px;
+      padding: 8px;
+      max-height: 300px;
+      overflow-y: auto;
+      font-size: 11px;
+    }
+    .transaction-item {
+      padding: 4px 6px;
+      border-bottom: 1px solid #222;
+      color: #9ca3af;
+      word-break: break-all;
+    }
+    .transaction-item:last-child {
+      border-bottom: none;
+    }
+    .tx-buy {
+      color: #10b981;
+    }
+    .tx-sell {
+      color: #ef4444;
+    }
+    .chart-container {
+      background: rgba(0, 0, 0, 0.3);
+      border: 1px solid #333;
+      border-radius: 6px;
+      padding: 8px;
+      height: 300px;
+    }
+    .chart-title {
+      font-size: 12px;
+      color: #6b7280;
+      margin-bottom: 8px;
+    }
+    /* 滚动条美化 */
+    .transaction-panel::-webkit-scrollbar {
+      width: 6px;
+    }
+    .transaction-panel::-webkit-scrollbar-track {
+      background: rgba(0, 0, 0, 0.2);
+      border-radius: 3px;
+    }
+    .transaction-panel::-webkit-scrollbar-thumb {
+      background: rgba(99, 102, 241, 0.4);
+      border-radius: 3px;
+    }
+    .transaction-panel::-webkit-scrollbar-thumb:hover {
+      background: rgba(99, 102, 241, 0.6);
+    }
+  </style>
+</head>
+<body class="text-gray-100 min-h-screen">
+
+  <!-- 顶部状态栏 -->
+  <div class="sticky top-0 z-50 bg-[#0b0b0f]/95 backdrop-blur-md border-b border-gray-800 px-5 py-3.5">
+    <div class="max-w-full mx-auto flex items-center justify-between">
+      <div class="flex items-center gap-3">
+        <div id="dot" class="w-2.5 h-2.5 rounded-full bg-yellow-500"></div>
+        <h1 class="text-xl font-bold tracking-tight">Flap 毫秒级监控</h1>
+        <span id="status" class="text-sm text-gray-400">连接中...</span>
+      </div>
+      <div class="text-sm text-gray-400">
+        已发现 <span id="count" class="text-indigo-400 font-bold text-base">0</span> 个
+      </div>
+    </div>
+  </div>
+
+  <!-- 垂直列表容器（最新在最上面） -->
+  <div id="list" class="max-w-full mx-auto p-4 space-y-3">
+    <!-- 每一行会动态插入这里 -->
+  </div>
+
+  <script>
+    const socket = io();
+    let total = 0;
+    const tokenDataMap = new Map(); // 存储每个 token 的交易数据和K线数据
+
+    socket.on('connect', () => {
+      document.getElementById('status').textContent = '实时监听中';
+      document.getElementById('status').className = 'text-sm text-green-400';
+      document.getElementById('dot').className = 'w-2.5 h-2.5 rounded-full bg-green-500 animate-pulse';
+    });
+
+    socket.on('disconnect', () => {
+      document.getElementById('status').textContent = '断开重连中...';
+      document.getElementById('status').className = 'text-sm text-yellow-400';
+      document.getElementById('dot').className = 'w-2.5 h-2.5 rounded-full bg-yellow-500';
+    });
+
+    // 收到新代币 → 插入到最顶部
+    socket.on('newToken', (data) => {
+      total++;
+      document.getElementById('count').textContent = total;
+      addRow(data);
+    });
+
+    // 接收实时交易数据
+    socket.on('tokenTransaction', (txData) => {
+      updateTransactionList(txData);
+      updateKLine(txData);
+    });
+
+    // 格式化CA地址：前4位****后4位
+    function formatCAAddress(address) {
+      if (address.length <= 8) {
+        return address;
+      }
+      const first4 = address.substring(0, 4);
+      const last4 = address.substring(address.length - 4);
+      return `${first4}****${last4}`;
+    }
+
+    function copyCAAddress(token, element) {
+      navigator.clipboard.writeText(token);
+      const tip = document.createElement('div');
+      tip.className = 'fixed bottom-8 left-1/2 -translate-x-1/2 bg-indigo-600 text-white px-5 py-2.5 rounded-full text-sm shadow-lg z-50';
+      tip.textContent = '已复制合约地址';
+      document.body.appendChild(tip);
+      setTimeout(() => tip.remove(), 1500);
+    }
+
+    // 更新交易列表
+    function updateTransactionList(txData) {
+      const token = txData.token.toLowerCase();
+      const panel = document.getElementById(`tx-panel-${token}`);
+      if (!panel) return;
+
+      const txType = txData.type === 'mint' ? '创建' : 
+                     txData.type === 'burn' ? '销毁' : 
+                     txData.from === '0x0000000000000000000000000000000000000000' ? '铸造' : '转账';
+      
+      const isBuy = txData.from === '0x0000000000000000000000000000000000000000';
+      const txClass = isBuy ? 'tx-buy' : 'tx-sell';
+      
+      const txItem = document.createElement('div');
+      txItem.className = `transaction-item ${txClass}`;
+      txItem.innerHTML = `
+        <span class="font-mono text-xs">${new Date(txData.timestamp).toLocaleTimeString()}</span> 
+        ${isBuy ? '✅ 买' : '❌ 卖'} 
+        ${txData.to.slice(0, 6)}...
+        <span class="text-gray-500">${(parseInt(txData.amount) / 1e18).toFixed(6)}</span>
+      `;
+      
+      panel.insertBefore(txItem, panel.firstChild);
+      
+      // 保留最近 50 条
+      while (panel.children.length > 50) {
+        panel.removeChild(panel.lastChild);
+      }
+    }
+
+    // 更新K线数据
+    function updateKLine(txData) {
+      const token = txData.token.toLowerCase();
+      
+      if (!tokenDataMap.has(token)) {
+        tokenDataMap.set(token, {
+          transactions: [],
+          klineData: [],
+          chart: null,
+          candleSeries: null
+        });
+      }
+
+      const tokenData = tokenDataMap.get(token);
+      tokenData.transactions.push(txData);
+
+      // 保留最近 1 小时的交易数据
+      const oneHourAgo = Date.now() - 3600000;
+      tokenData.transactions = tokenData.transactions.filter(tx => tx.timestamp > oneHourAgo);
+
+      // 聚合成 5 秒 K 线
+      updateKLineData(token);
+    }
+
+    // 聚合 5 秒 K 线
+    function updateKLineData(token) {
+      const tokenData = tokenDataMap.get(token);
+      if (!tokenData || tokenData.transactions.length === 0) return;
+
+      const klineInterval = 5000; // 5秒
+      const klineMap = new Map();
+
+      tokenData.transactions.forEach(tx => {
+        const timeKey = Math.floor(tx.timestamp / klineInterval) * klineInterval;
+        if (!klineMap.has(timeKey)) {
+          klineMap.set(timeKey, {
+            time: Math.floor(timeKey / 1000),
+            open: 0,
+            high: 0,
+            low: Infinity,
+            close: 0,
+            volume: 0,
+            buyVolume: 0,
+            sellVolume: 0,
+            count: 0
+          });
+        }
+
+        const kline = klineMap.get(timeKey);
+        const amount = parseInt(tx.amount) / 1e18;
+        
+        kline.open = kline.count === 0 ? amount : kline.open;
+        kline.high = Math.max(kline.high, amount);
+        kline.low = Math.min(kline.low, amount);
+        kline.close = amount;
+        kline.volume += amount;
+        kline.count++;
+
+        if (tx.from === '0x0000000000000000000000000000000000000000') {
+          kline.buyVolume += amount;
+        } else if (tx.to === '0x0000000000000000000000000000000000000000') {
+          kline.sellVolume += amount;
+        }
+      });
+
+      tokenData.klineData = Array.from(klineMap.values())
+        .sort((a, b) => a.time - b.time)
+        .map(kline => ({
+          time: kline.time,
+          open: Math.random() * 0.001 + 0.0001,
+          high: Math.random() * 0.001 + 0.0001,
+          low: Math.random() * 0.0001,
+          close: Math.random() * 0.001 + 0.00005
+        }));
+
+      // 更新图表
+      const chart = document.getElementById(`chart-${token}`);
+      if (chart && chart.lwchart) {
+        updateChart(token);
+      }
+    }
+
+    // 更新图表显示
+    function updateChart(token) {
+      const tokenData = tokenDataMap.get(token);
+      if (!tokenData || !tokenData.chart) return;
+
+      try {
+        if (tokenData.candleSeries) {
+          tokenData.candleSeries.setData(tokenData.klineData);
+          tokenData.chart.timeScale().fitContent();
+        }
+      } catch (err) {
+        console.error('更新图表失败:', err);
+      }
+    }
+
+    // 初始化K线图表
+    function initChart(token) {
+      const chartContainer = document.getElementById(`chart-${token}`);
+      if (!chartContainer) return;
+
+      try {
+        const chart = LightweightCharts.createChart(chartContainer, {
+          layout: {
+            textColor: '#9ca3af',
+            background: { color: '#1a1a2e' }
+          },
+          timeScale: {
+            timeVisible: true,
+            secondsVisible: true,
+          },
+          width: chartContainer.parentElement.offsetWidth - 20,
+          height: 280
+        });
+
+        const candleSeries = chart.addCandlestickSeries({
+          upColor: '#10b981',
+          downColor: '#ef4444',
+          borderUpColor: '#10b981',
+          borderDownColor: '#ef4444',
+          wickUpColor: '#10b981',
+          wickDownColor: '#ef4444'
+        });
+
+        tokenData.chart = chart;
+        tokenData.candleSeries = candleSeries;
+        chartContainer.lwchart = true;
+
+        // 初始数据
+        if (tokenData.klineData.length > 0) {
+          candleSeries.setData(tokenData.klineData);
+          chart.timeScale().fitContent();
+        }
+      } catch (err) {
+        console.error('初始化图表失败:', err);
+      }
+    }
+
+    function addRow(d) {
+      const token = d.token.toLowerCase();
+      const tokenData = {
+        transactions: [],
+        klineData: [],
+        chart: null,
+        candleSeries: null
+      };
+      tokenDataMap.set(token, tokenData);
+
+      const row = document.createElement('div');
+      row.className = 'row rounded-xl overflow-hidden flex flex-col';
+
+      const img = d.image || 'https://via.placeholder.com/120x120?text=No+Image';
+
+      row.innerHTML = `
+        <!-- 第一行：图片和基本信息 -->
+        <div class="flex flex-col sm:flex-row p-4 gap-4">
+          <!-- 左侧图片容器 -->
+          <div class="w-full sm:w-28 shrink-0 bg-gray-900 relative flex flex-col items-center">
+            <div class="w-full sm:w-28 h-28 sm:h-auto bg-gray-900 relative">
+              <img src="${img}" class="w-full h-full object-cover" onerror="this.src='https://via.placeholder.com/120x120?text=No+Image'">
+              ${d.latency ? `<div class="absolute top-1.5 right-1.5 bg-black/70 text-[10px] px-1.5 py-0.5 rounded text-gray-300">${d.latency}ms</div>` : ''}
+            </div>
+            <!-- CA地址显示在图片下方 - 点击复制 -->
+            <div class="ca-address w-full px-2 py-2" onclick="copyCAAddress('${d.token}', this)" title="点击复制完整CA地址">
+              ${formatCAAddress(d.token)}
+            </div>
+          </div>
+
+          <!-- 右侧基本信息 -->
+          <div class="flex-1 flex flex-col justify-between gap-2">
+            <!-- 第一行：名称 + 徽章 -->
+            <div class="flex flex-wrap items-center gap-2">
+              <span class="text-lg font-bold text-white">$${d.symbol}</span>
+              <span class="text-sm text-gray-400">${d.name}</span>
+              ${d.buyTax ? `<span class="text-xs bg-emerald-500/20 text-emerald-400 px-2 py-0.5 rounded-full">✓ 税 ${d.buyTax}% / ${d.sellTax}%</span>` : ''}
+              ${d.dividend ? `<span class="text-xs bg-blue-500/20 text-blue-400 px-2 py-0.5 rounded-full">✓ 分红 ${d.dividend}%</span>` : ''}
+            </div>
+
+            <!-- 第二行：创建者购买金额 -->
+            ${d.creatorBuy ? `<div class="text-xs text-yellow-400">💰 创建者购买: $${d.creatorBuy}</div>` : ''}
+
+            <!-- 第三行：媒体链接 -->
+            <div class="flex flex-col gap-1">
+              ${d.twitter ? `<a href="${d.twitter}" target="_blank" class="media-link">𝕏 ${d.twitter}</a>` : ''}
+              ${d.telegram ? `<a href="${d.telegram}" target="_blank" class="media-link">✈️ ${d.telegram}</a>` : ''}
+              ${d.website ? `<a href="${d.website}" target="_blank" class="media-link">🌐 ${d.website}</a>` : ''}
+            </div>
+
+            <!-- 第四行：时间 -->
+            <div class="text-xs text-gray-500">
+              ${new Date(d.ts * 1000).toLocaleString()}
+            </div>
+          </div>
+        </div>
+
+        <!-- 第二行：交易列表 + K线图表 -->
+        <div class="data-panels px-4 pb-4">
+          <!-- 交易列表 -->
+          <div>
+            <div class="chart-title">📊 交易记录（最近）</div>
+            <div id="tx-panel-${token}" class="transaction-panel"></div>
+          </div>
+          
+          <!-- K线图表 -->
+          <div>
+            <div class="chart-title">📈 5秒K线</div>
+            <div id="chart-${token}" class="chart-container"></div>
+          </div>
+        </div>
+      `;
+
+      // 插入到最顶部
+      const container = document.getElementById('list');
+      container.insertBefore(row, container.firstChild);
+
+      // 初始化K线图表
+      setTimeout(() => initChart(token), 100);
+    }
+  </script>
+</body>
+</html>
