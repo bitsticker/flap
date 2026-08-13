@@ -11,7 +11,6 @@ const io = new Server(server, {
   cors: { origin: '*' }
 });
 
-// 静态文件
 app.use(express.static(path.join(__dirname, 'public')));
 
 // ==================== 配置 ====================
@@ -20,9 +19,8 @@ const TAX_HELPER = '0x53841c73217735F37BC1775538b03b23feFD8346';
 const WSS = process.env.BSC_WSS || 'wss://bsc-rpc.publicnode.com';
 const IPFS = 'https://flap.mypinata.cloud/ipfs/';
 const PORT = process.env.PORT || 3000;
-const BNB_PRICE_USD = 600; // 设置 BNB 价格（可从链上获取或 API 更新）
+const BNB_PRICE_USD = 600;
 
-// 筛选条件
 const MAX_TAX_RATE = 5;
 const TARGET_DIVIDEND = 100;
 
@@ -52,10 +50,11 @@ const ERC20_ABI = [
 let provider, portal, helper;
 let statsTotal = 0;
 let statsFiltered = 0;
-const monitoredTokens = new Map();
+let statsTransactions = 0;
+const monitoredTokens = new Map(); // { tokenAddress => { contract, decimals, filter } }
 const tokenTransactions = new Map();
 const tokenCreatorInfo = new Map();
-const tokenMetrics = new Map(); // 存储每个 CA 的市值指标
+const tokenMetrics = new Map();
 
 // ==================== 初始化监听 ====================
 async function startMonitor() {
@@ -64,10 +63,9 @@ async function startMonitor() {
     portal = new ethers.Contract(PORTAL, PORTAL_ABI, provider);
     helper = new ethers.Contract(TAX_HELPER, HELPER_ABI, provider);
 
-    console.log('✅ BSC_WSS 监控已启动（毫秒级）');
-    console.log(`🔥 源头过滤条件：买税 ≤ ${MAX_TAX_RATE}% 且 卖税 ≤ ${MAX_TAX_RATE}% 且 分红 = ${TARGET_DIVIDEND}%`);
-    console.log('📡 为符合条件的 CA 创建独立监听器');
-    console.log('前端地址: http://localhost:' + PORT);
+    console.log('✅ BSC_WSS 监控已启动（毫秒级实时）');
+    console.log(`🔥 过滤条件：买税 ≤ ${MAX_TAX_RATE}% 且 卖税 ≤ ${MAX_TAX_RATE}% 且 分红 = ${TARGET_DIVIDEND}%`);
+    console.log('📡 只监听符合条件代币的实时 Transfer 事件\n');
 
     portal.on('TokenCreated', async (ts, creator, nonce, token, name, symbol, meta, event) => {
       const start = Date.now();
@@ -78,7 +76,7 @@ async function startMonitor() {
         
         if (!meetsCriteria(taxInfo)) {
           const latency = Date.now() - start;
-          console.log(`⏭️  [${latency}ms] 链上过滤 → ${symbol}`);
+          console.log(`⏭️  [${latency}ms] 过滤 → ${symbol}`);
           return;
         }
 
@@ -96,7 +94,6 @@ async function startMonitor() {
 
         const latency = Date.now() - start;
         data.latency = latency;
-
         statsFiltered++;
         
         tokenTransactions.set(token.toLowerCase(), []);
@@ -108,7 +105,6 @@ async function startMonitor() {
           decimals: 18
         });
         
-        // 初始化市值指标
         tokenMetrics.set(token.toLowerCase(), {
           totalTokenSupply: 0,
           totalBNBInvested: 0,
@@ -120,17 +116,19 @@ async function startMonitor() {
           lastPrice: 0
         });
         
-        startTokenMonitoring(token.toLowerCase(), creator.toLowerCase(), data);
+        // 启动实时 Transfer 监听
+        await startTokenMonitoring(token.toLowerCase(), creator.toLowerCase(), data);
         
         io.emit('newToken', data);
-        console.log(`✅ [${latency}ms] 符合条件推送 → $${symbol}`);
+        console.log(`✅ [${latency}ms] 发现符合条件的代币 → $${symbol}\n`);
 
         if (statsTotal % 50 === 0) {
           const ratio = ((statsFiltered / statsTotal) * 100).toFixed(2);
           console.log(`\n📊 ============ 统计报告 ============`);
           console.log(`   📡 链上监听总数：${statsTotal} 个`);
           console.log(`   ✅ 符合条件已推送：${statsFiltered} 个`);
-          console.log(`   🔍 正在监听的 CA 数：${monitoredTokens.size}`);
+          console.log(`   📝 总 Transfer 事件：${statsTransactions} 笔`);
+          console.log(`   🔍 实时监听中的 CA 数：${monitoredTokens.size}`);
           console.log(`=====================================\n`);
         }
       } catch (err) {
@@ -148,7 +146,7 @@ async function startMonitor() {
   }
 }
 
-// ==================== 为符合条件的 CA 创建独立监听 ====================
+// ==================== 启动实时 Transfer 监听 ====================
 async function startTokenMonitoring(tokenAddress, creator, tokenData) {
   try {
     const contract = new ethers.Contract(tokenAddress, ERC20_ABI, provider);
@@ -165,39 +163,43 @@ async function startTokenMonitoring(tokenAddress, creator, tokenData) {
       creatorInfo.decimals = decimals;
     }
     
-    // 监听 Transfer 事件
-    contract.on('Transfer', (from, to, amount, event) => {
+    // 【关键】创建针对该代币的 Transfer 过滤器
+    // 这样每个代币有自己独立的监听器，不会收到其他代币的事件
+    const transferFilter = contract.filters.Transfer();
+    
+    // 实时监听该代币的所有 Transfer 事件
+    contract.on(transferFilter, (from, to, amount, event) => {
+      const startTime = Date.now();
+      
       const fromLower = from.toLowerCase();
       const toLower = to.toLowerCase();
       const amountNum = parseInt(amount.toString());
       const amountFormatted = (amountNum / Math.pow(10, decimals)).toFixed(8);
       
-      // 判断交易类型和方向
       const isMint = fromLower === '0x0000000000000000000000000000000000000000';
       const isBurn = toLower === '0x0000000000000000000000000000000000000000';
       
-      // 创建交易数据
       const txData = {
         token: tokenAddress,
         from: fromLower,
         to: toLower,
-        amount: amount.toString(), // 保持为 BigInt 字符串格式
+        amount: amount.toString(),
         amountFormatted: amountFormatted,
         transactionHash: event.log.transactionHash,
         blockNumber: event.log.blockNumber,
         timestamp: Date.now(),
         type: isMint ? 'mint' : isBurn ? 'burn' : 'transfer',
-        isBuy: isMint, // 铸造 = 买入
-        isSell: isBurn, // 销毁 = 卖出
+        isBuy: isMint,
+        isSell: isBurn,
         isCreatorBuy: toLower === creator && isMint
       };
       
-      console.log(`📝 [交易事件] ${tokenAddress.slice(0, 10)}... | 类型: ${txData.type} | 金额: ${amountFormatted}`);
+      const processingTime = Date.now() - startTime;
+      console.log(`📝 [Transfer] ${tokenAddress.slice(0, 10)}... | ${txData.type.padEnd(8)} | ${amountFormatted} | ${processingTime}ms`);
+      statsTransactions++;
       
-      // 更新市值指标
       updateTokenMetrics(tokenAddress, txData, decimals);
       
-      // 如果是创建者购买，更新创建者信息
       if (txData.isCreatorBuy) {
         const creatorInfo = tokenCreatorInfo.get(tokenAddress);
         if (creatorInfo) {
@@ -223,9 +225,9 @@ async function startTokenMonitoring(tokenAddress, creator, tokenData) {
       if (transactions.length > 1000) transactions.pop();
       tokenTransactions.set(tokenAddress, transactions);
       
-      // 推送交易数据和市值信息给前端
+      // 推送到前端
       const metrics = tokenMetrics.get(tokenAddress) || {};
-      const emitData = {
+      io.emit('tokenTransaction', {
         token: tokenAddress,
         from: fromLower,
         to: toLower,
@@ -242,14 +244,11 @@ async function startTokenMonitoring(tokenAddress, creator, tokenData) {
           currentPrice: metrics.currentPrice,
           totalBNBInvested: metrics.totalBNBInvested
         }
-      };
-      
-      io.emit('tokenTransaction', emitData);
-      console.log(`📤 [推送交易] token: ${tokenAddress.slice(0, 10)}...`);
+      });
     });
     
-    monitoredTokens.set(tokenAddress, contract);
-    console.log(`   ✅ Transfer 监听已启动: ${tokenAddress.slice(0, 10)}...`);
+    monitoredTokens.set(tokenAddress, { contract, decimals, filter: transferFilter });
+    console.log(`   ✅ Transfer 监听已启动: ${tokenAddress.slice(0, 10)}...\n`);
   } catch (err) {
     console.error(`❌ 监听失败 ${tokenAddress}:`, err.message);
   }
@@ -262,7 +261,6 @@ function updateTokenMetrics(tokenAddress, txData, decimals) {
   
   const amount = parseFloat(txData.amountFormatted);
   
-  // 更新代币供应量
   if (txData.isBuy) {
     metrics.totalTokenSupply += amount;
     metrics.buyVolume += amount;
@@ -271,16 +269,11 @@ function updateTokenMetrics(tokenAddress, txData, decimals) {
     metrics.sellVolume += amount;
   }
   
-  // 简化的价格计算：假设每次交易 1 个代币花费约 0.00001 BNB
-  // 实际应该从交易数据中提取真实的 BNB 投入量
-  // 这里使用启发式方法：根据交易大小估计价格
   if (txData.isBuy) {
-    // 估计 BNB 投入（这是简化的，实际需要从交易数据解析）
-    const estimatedBNB = amount * 0.00001; // 占位符
+    const estimatedBNB = amount * 0.00001;
     metrics.totalBNBInvested += estimatedBNB;
   }
   
-  // 计算当前价格和市值
   if (metrics.totalTokenSupply > 0 && metrics.totalBNBInvested > 0) {
     metrics.currentPrice = (metrics.totalBNBInvested / metrics.totalTokenSupply).toFixed(10);
     metrics.marketCapBNB = (metrics.totalTokenSupply * parseFloat(metrics.currentPrice)).toFixed(4);
